@@ -57,6 +57,11 @@ public:
       */
     UInt64 getMaxSourcePartsSizeForMerge(size_t max_count, size_t scheduled_tasks_count) const;
 
+    /** Get maximum total size of parts to do stale merge, at current moment of time.
+      * It depends on number of free threads in background_pool and amount of free space in disk.
+      */
+    UInt64 getMaxSourcePartsSizeForStaleMerge() const;
+
     /** Get maximum total size of parts to do mutation, at current moment of time.
       * It depends only on amount of free space in disk.
       */
@@ -89,6 +94,7 @@ public:
     /// The second step of selecting parts to merge: splits parts list into a set of ranges according to can_merge_callback.
     /// All parts within a range can be merged without violating some invariants.
     MergeSelectingInfo getPossibleMergeRanges(
+        bool stale_part_allowed,
         const MergeTreeData::DataPartsVector & data_parts,
         const AllowedMergingPredicate & can_merge_callback,
         const MergeTreeTransactionPtr & txn,

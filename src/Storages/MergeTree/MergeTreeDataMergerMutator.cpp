@@ -107,6 +107,18 @@ UInt64 MergeTreeDataMergerMutator::getMaxSourcePartsSizeForMerge(size_t max_coun
     return std::min(max_size, static_cast<UInt64>(data.getStoragePolicy()->getMaxUnreservedFreeSpace() / DISK_USAGE_COEFFICIENT_TO_SELECT));
 }
 
+UInt64 MergeTreeDataMergerMutator::getMaxSourcePartsSizeForStaleMerge() const
+{
+    const auto data_settings = data.getSettings();
+    size_t scheduled_tasks_count = CurrentMetrics::values[CurrentMetrics::BackgroundMergesAndMutationsPoolTask].load(std::memory_order_relaxed);
+    auto max_tasks_count = data.getContext()->getMergeMutateExecutor()->getMaxTasksCount();
+
+    if (scheduled_tasks_count <= 1
+        || max_tasks_count - scheduled_tasks_count >= data_settings->number_of_free_entries_in_pool_to_execute_stale_merge)
+        return getMaxSourcePartsSizeForMerge(max_tasks_count, scheduled_tasks_count);
+
+    return 0;
+}
 
 UInt64 MergeTreeDataMergerMutator::getMaxSourcePartSizeForMutation() const
 {
@@ -149,7 +161,8 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMerge(
         return SelectPartsDecision::CANNOT_SELECT;
     }
 
-    MergeSelectingInfo info = getPossibleMergeRanges(data_parts, can_merge_callback, txn, out_disable_reason);
+    // Prioritize merge the most recently written part.
+    MergeSelectingInfo info = getPossibleMergeRanges(/*stale_part_allowed*/false, data_parts, can_merge_callback, txn, out_disable_reason);
 
     if (info.parts_selected_precondition == 0)
     {
@@ -162,6 +175,24 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMerge(
 
     if (res == SelectPartsDecision::SELECTED)
         return res;
+
+    UInt64 max_total_size_to_stale_merge = getMaxSourcePartsSizeForStaleMerge();
+    if (max_total_size_to_stale_merge > 0) {
+        // mrege stale parts if no recently merges
+        info = getPossibleMergeRanges(/*stale_part_allowed*/true, data_parts, can_merge_callback, txn, out_disable_reason);
+
+        if (info.parts_selected_precondition == 0)
+        {
+            out_disable_reason = PreformattedMessage::create("No parts satisfy preconditions for merge");
+            return SelectPartsDecision::CANNOT_SELECT;
+        }
+
+        res = selectPartsToMergeFromRanges(future_part, aggressive, max_total_size_to_stale_merge, merge_with_ttl_allowed,
+                                        metadata_snapshot, info.parts_ranges, info.current_time, out_disable_reason);
+
+        if (res == SelectPartsDecision::SELECTED)
+            return res;
+    }
 
     String best_partition_id_to_optimize = getBestPartitionToOptimizeEntire(info.partitions_info);
     if (!best_partition_id_to_optimize.empty())
@@ -197,7 +228,7 @@ MergeTreeDataMergerMutator::PartitionIdsHint MergeTreeDataMergerMutator::getPart
     auto metadata_snapshot = data.getInMemoryMetadataPtr();
 
     PreformattedMessage out_reason;
-    MergeSelectingInfo info = getPossibleMergeRanges(data_parts, can_merge_callback, txn, out_reason);
+    MergeSelectingInfo info = getPossibleMergeRanges(/*stale_part_allowed*/true, data_parts, can_merge_callback, txn, out_reason);
 
     if (info.parts_selected_precondition == 0)
         return res;
@@ -328,6 +359,7 @@ MergeTreeData::DataPartsVector MergeTreeDataMergerMutator::getDataPartsToSelectM
 }
 
 MergeTreeDataMergerMutator::MergeSelectingInfo MergeTreeDataMergerMutator::getPossibleMergeRanges(
+    bool stale_part_allowed,
     const MergeTreeData::DataPartsVector & data_parts,
     const AllowedMergingPredicate & can_merge_callback,
     const MergeTreeTransactionPtr & txn,
@@ -336,6 +368,8 @@ MergeTreeDataMergerMutator::MergeSelectingInfo MergeTreeDataMergerMutator::getPo
     MergeSelectingInfo res;
 
     res.current_time = std::time(nullptr);
+
+    const auto data_settings = data.getSettings();
 
     IMergeSelector::PartsRanges & parts_ranges = res.parts_ranges;
 
@@ -412,6 +446,16 @@ MergeTreeDataMergerMutator::MergeSelectingInfo MergeTreeDataMergerMutator::getPo
         part_info.ttl_infos = &part->ttl_infos;
         part_info.compression_codec_desc = part->default_codec->getFullCodecDesc();
         part_info.shall_participate_in_merges = has_volumes_with_disabled_merges ? part->shallParticipateInMerges(storage_policy) : true;
+
+        if (part_info.shall_participate_in_merges &&
+            data_settings->part_stale_after_max_time_passed_seconds > 0) {
+            auto min_max_time = part->getMinMaxTime();
+            if (min_max_time.second > 0 &&
+                min_max_time.second < res.current_time &&
+                static_cast<UInt64>(res.current_time - min_max_time.second) > data_settings->part_stale_after_max_time_passed_seconds) {
+                part_info.shall_participate_in_merges = stale_part_allowed;
+            }
+        }
 
         auto & partition_info = partitions_info[partition_id];
         partition_info.min_age = std::min(partition_info.min_age, part_info.age);
