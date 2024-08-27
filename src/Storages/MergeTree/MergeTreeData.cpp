@@ -1368,7 +1368,8 @@ MergeTreeData::LoadPartResult MergeTreeData::loadDataPart(
     const String & part_name,
     const DiskPtr & part_disk_ptr,
     MergeTreeDataPartState to_state,
-    std::mutex & part_loading_mutex)
+    std::mutex & part_loading_mutex,
+    bool check_consistency)
 {
     LOG_TRACE(log, "Loading {} part {} from disk {}", magic_enum::enum_name(to_state), part_name, part_disk_ptr->getName());
 
@@ -1443,7 +1444,7 @@ MergeTreeData::LoadPartResult MergeTreeData::loadDataPart(
 
     try
     {
-        res.part->loadColumnsChecksumsIndexes(require_part_metadata, true);
+        res.part->loadColumnsChecksumsIndexes(require_part_metadata, check_consistency);
     }
     catch (...)
     {
@@ -1563,7 +1564,8 @@ MergeTreeData::LoadPartResult MergeTreeData::loadDataPartWithRetries(
     std::mutex & part_loading_mutex,
     size_t initial_backoff_ms,
     size_t max_backoff_ms,
-    size_t max_tries)
+    size_t max_tries,
+    bool check_consistency)
 {
     auto handle_exception = [&, this](std::exception_ptr exception_ptr, size_t try_no)
     {
@@ -1582,7 +1584,7 @@ MergeTreeData::LoadPartResult MergeTreeData::loadDataPartWithRetries(
     {
         try
         {
-            return loadDataPart(part_info, part_name, part_disk_ptr, to_state, part_loading_mutex);
+            return loadDataPart(part_info, part_name, part_disk_ptr, to_state, part_loading_mutex, check_consistency);
         }
         catch (...)
         {
@@ -1596,7 +1598,7 @@ MergeTreeData::LoadPartResult MergeTreeData::loadDataPartWithRetries(
 }
 
 
-std::vector<MergeTreeData::LoadPartResult> MergeTreeData::loadDataPartsFromDisk(PartLoadingTreeNodes & parts_to_load)
+std::vector<MergeTreeData::LoadPartResult> MergeTreeData::loadDataPartsFromDisk(PartLoadingTreeNodes & parts_to_load, bool check_consistency)
 {
     const size_t num_parts = parts_to_load.size();
 
@@ -1647,7 +1649,7 @@ std::vector<MergeTreeData::LoadPartResult> MergeTreeData::loadDataPartsFromDisk(
                 auto res = loadDataPartWithRetries(
                     part->info, part->name, part->disk,
                     DataPartState::Active, part_loading_mutex, loading_parts_initial_backoff_ms,
-                    loading_parts_max_backoff_ms, loading_parts_max_tries);
+                    loading_parts_max_backoff_ms, loading_parts_max_tries, check_consistency);
 
                 part->is_loaded = true;
                 bool is_active_part = res.part->getState() == DataPartState::Active;
@@ -1831,7 +1833,9 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks, std::optional<std::un
 
     if (num_parts > 0)
     {
-        auto loaded_parts = loadDataPartsFromDisk(active_parts);
+        auto loaded_parts = loadDataPartsFromDisk(active_parts, false /* check_consistency */);
+
+        checkConsistencyForLatestLoadedParts(loaded_parts);
 
         for (const auto & res : loaded_parts)
         {
@@ -1980,6 +1984,51 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks, std::optional<std::un
     data_parts_loading_finished = true;
 }
 
+void MergeTreeData::checkConsistencyForLatestLoadedParts(std::vector<MergeTreeData::LoadPartResult>& loaded_parts)
+{
+    std::sort(loaded_parts.begin(), loaded_parts.end(), [](const LoadPartResult & a, const LoadPartResult & b) {
+        return a.part->modification_time > b.part->modification_time;
+    });
+
+    if (loaded_parts.empty()) return;
+
+    auto max_mod_time = loaded_parts.front().part->modification_time;
+
+    ThreadPoolCallbackRunnerLocal<void> runner(getActivePartsLoadingThreadPool().get(), "ActiveParts");
+    for (auto & res: loaded_parts) {
+        if (res.is_broken) continue;
+
+        if (max_mod_time - res.part->modification_time > 300) {
+            break;
+        }
+
+        runner(
+            [&res, this]()
+            {
+                try
+                {
+                    res.part->checkConsistencyWithProjections(require_part_metadata);
+                }
+                catch (...)
+                {
+                    res.is_broken = true;
+                    tryLogCurrentException(log, fmt::format("while loading part {}", res.part->name));
+
+                    auto part_size_str = res.size_of_part ? formatReadableSizeWithBinarySuffix(*res.size_of_part) : "failed to calculate size";
+
+                    LOG_ERROR(log,
+                        "Detaching broken part {} (size: {}). "
+                        "If it happened after update, it is likely because of backward incompatibility. "
+                        "You need to resolve this manually",
+                        res.part->name, part_size_str);
+                }
+            }, Priority{0});
+
+    }
+    /// Wait for all scheduled tasks.
+    runner.waitForAllToFinishAndRethrowFirstError();
+}
+
 void MergeTreeData::loadUnexpectedDataParts()
 try
 {
@@ -2102,7 +2151,7 @@ try
             auto res = loadDataPartWithRetries(
             my_part->info, my_part->name, my_part->disk,
             DataPartState::Outdated, data_parts_mutex, loading_parts_initial_backoff_ms,
-            loading_parts_max_backoff_ms, loading_parts_max_tries);
+            loading_parts_max_backoff_ms, loading_parts_max_tries, true /* check_consistency */);
 
             ++num_loaded_parts;
             if (res.is_broken)

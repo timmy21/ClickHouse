@@ -1671,7 +1671,8 @@ private:
         const String & part_name,
         const DiskPtr & part_disk_ptr,
         MergeTreeDataPartState to_state,
-        std::mutex & part_loading_mutex);
+        std::mutex & part_loading_mutex,
+        bool check_consistency);
 
     LoadPartResult loadDataPartWithRetries(
         const MergeTreePartInfo & part_info,
@@ -1681,9 +1682,12 @@ private:
         std::mutex & part_loading_mutex,
         size_t backoff_ms,
         size_t max_backoff_ms,
-        size_t max_tries);
+        size_t max_tries,
+        bool check_consistency);
 
-    std::vector<LoadPartResult> loadDataPartsFromDisk(PartLoadingTreeNodes & parts_to_load);
+    std::vector<LoadPartResult> loadDataPartsFromDisk(PartLoadingTreeNodes & parts_to_load, bool check_consistency);
+
+    void checkConsistencyForLatestLoadedParts(std::vector<LoadPartResult>& loaded_parts);
 
     /// Create zero-copy exclusive lock for part and disk. Useful for coordination of
     /// distributed operations which can lead to data duplication. Implemented only in ReplicatedMergeTree.
